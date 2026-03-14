@@ -138,6 +138,103 @@ We can see the resulting scores look good!
 |     |       |strict-match    |     5|exact_match|↑  |0.720|±  |0.0285|
 ```
 
+---
+
+## iMatrix Importance-Weighted Quantization
+
+`imatrix_mse` is an observer that uses per-channel activation importance (E[x²]) to weight quantization error during range selection. Channels that carry more signal get more careful range optimization.
+
+Two components work together:
+- **`IMatrixGatherer`**: collects E[x²] per input channel via forward pre-hooks during calibration
+- **`imatrix_mse` observer**: extends the MSE grid search with importance weighting: `err = sum(importance * |Q(w) - w|^p)`
+
+> See [RFC #2456](https://github.com/vllm-project/llm-compressor/discussions/2456) for the full design discussion.
+
+### Usage
+
+```bash
+python3 llama3_imatrix_example.py
+```
+
+The simplest setup uses `preset_name_to_scheme` to configure W4A16 and swaps in the `imatrix_mse` observer:
+
+```python
+from compressed_tensors.quantization import preset_name_to_scheme
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+
+scheme = preset_name_to_scheme("W4A16", ["Linear"])
+scheme.weights.observer = "imatrix_mse"
+
+recipe = [
+    IMatrixGatherer(ignore=["lm_head"]),
+    QuantizationModifier(
+        config_groups={"group_0": scheme},
+        ignore=["lm_head"],
+    ),
+]
+```
+
+### Composing with AWQ and GPTQ
+
+iMatrix is additive — it composes with any quantization method:
+
+```python
+from llmcompressor.modifiers.awq import AWQModifier
+from llmcompressor.modifiers.gptq import GPTQModifier
+
+scheme = preset_name_to_scheme("W4A16", ["Linear"])
+scheme.weights.observer = "imatrix_mse"
+
+recipe = [
+    AWQModifier(ignore=["lm_head"], scheme="W4A16", targets=["Linear"]),
+    IMatrixGatherer(ignore=["lm_head"]),
+    GPTQModifier(
+        config_groups={"group_0": scheme},
+        ignore=["lm_head"],
+    ),
+]
+```
+
+### Results (Llama-3.1-8B, WikiText PPL)
+
+**W4A16, group_size=128:**
+
+| Config | PPL |
+|---|---|
+| RTN `memoryless_minmax` | 6.78 |
+| RTN `imatrix_mse` | 6.76 |
+| GPTQ | 6.58 |
+| AWQ + GPTQ + `imatrix_mse` | 6.52 |
+
+**W4A16, group_size=32:**
+
+| Config | PPL |
+|---|---|
+| RTN `memoryless_minmax` gs128 | 6.78 |
+| RTN `imatrix_mse` gs32 | 6.46 |
+| AWQ + GPTQ + `imatrix_mse` gs32 | 6.39 |
+
+RTN `imatrix_mse` gs32 (6.46) outperforms GPTQ gs128 (6.58) in ~40s vs ~800s.
+
+### Observer Parameters
+
+The observer accepts optional `observer_kwargs` for fine-tuning:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `norm` | 2.4 | Error exponent (`\|Q(w) - w\|^norm`) |
+| `maxshrink` | 0.20 | Max fraction to shrink the range |
+| `grid` | 20 | Number of grid search steps |
+| `patience` | 5 | Early stopping after N steps without improvement |
+| `maxgrow` | 0.0 | Max fraction to grow the range beyond observed min/max |
+
+The defaults work well for most cases. To customize:
+
+```python
+scheme.weights.observer_kwargs = {"maxgrow": 0.10}
+```
+
 ### Questions or Feature Request?
 
 Please open up an issue on `vllm-project/llm-compressor`
